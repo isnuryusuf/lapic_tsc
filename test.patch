@@ -1,0 +1,106 @@
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1a2da0e..13047ed 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1314,7 +1314,8 @@ static bool lapic_timer_int_injected(struct kvm_vcpu *vcpu)
+ void wait_lapic_expire(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+-	u64 guest_tsc, tsc_deadline;
++	unsigned long this_tsc_khz = vcpu->arch.virtual_tsc_khz;
++	u64 guest_tsc, tsc_deadline, delay_ns;
+ 
+ 	if (!lapic_in_kernel(vcpu))
+ 		return;
+@@ -1327,12 +1328,59 @@ void wait_lapic_expire(struct kvm_vcpu *vcpu)
+ 
+ 	tsc_deadline = apic->lapic_timer.expired_tscdeadline;
+ 	apic->lapic_timer.expired_tscdeadline = 0;
++
+ 	guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
++
++	/*
++	 * Tracepoint to support tuning lapic_timer_advance_ns.
++	 * E.g. look at the largest positive value this reports, and set
++	 * lapic_timer_advance_ns to cancel it out.
++	 *
++	 * It means we won't mind occasional bogus values (see comment below).
++	 * Or that it was defined to return guest TSC ticks instead of ns :-D.
++	 */
+ 	trace_kvm_wait_lapic_expire(vcpu->vcpu_id, guest_tsc - tsc_deadline);
+ 
+-	/* __delay is delay_tsc whenever the hardware has TSC, thus always.  */
+-	if (guest_tsc < tsc_deadline)
+-		__delay(tsc_deadline - guest_tsc);
++	if (guest_tsc >= tsc_deadline)
++		return;
++
++	delay_ns = (tsc_deadline - guest_tsc) * 1000000ULL;
++	do_div(delay_ns, this_tsc_khz);
++
++	if (delay_ns > lapic_timer_advance_ns) {
++		/*
++		 * Oops.  Guest TSC was adjusted backwards, leaving a
++		 * value of expired_tscdeadline which is too far in the future
++		 * (which might or might not have been caused by an outdated
++		 * hrtimer, which fired too soon).
++		 * Or maybe this is also being triggered by another issue; we
++		 * haven't checked the root cause yet.
++		 * If we start handling tsc adjustments correctly, the message
++		 * can be elevated to KERN_ERROR.
++		 *
++		 * We can also get one false positive at the time the user
++		 * reduces lapic_timer_advance_ns.  Hopefully they don't mind
++		 * the message.  But let's be conservative and not wake the
++		 * guest early in that case.
++		 */
++		vcpu_unimpl(vcpu,
++		            "cancelled %lluns busy-wait. tsc was adjusted while tsc deadline set.\n",
++		            delay_ns);
++		delay_ns = lapic_timer_advance_ns;
++		tsc_deadline = guest_tsc + (lapic_timer_advance_ns *
++		                            this_tsc_khz);
++	}
++
++	/* an alternative to this would be to apply the inverse of the guest TSC scaling ratio, then we could use __delay() as before */
++	while(1) {
++		ndelay(min(delay_ns, 1000ULL));
++
++		guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
++		if (guest_tsc >= tsc_deadline)
++			return;
++		delay_ns = (tsc_deadline - guest_tsc) * 1000000ULL;
++		do_div(delay_ns, this_tsc_khz);
++	}
+ }
+ 
+ static void start_apic_timer(struct kvm_lapic *apic)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 9b7798c..b279cab 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1401,6 +1401,11 @@ static u64 kvm_compute_tsc_offset(struct kvm_vcpu *vcpu, u64 target_tsc)
+ 
+ 	tsc = kvm_scale_tsc(vcpu, rdtsc());
+ 
++	if (printk_ratelimit()) {
++	pr_warning("TSC adj %lld\n", target_tsc - tsc);
++	dump_stack();
++	}
++
+ 	return target_tsc - tsc;
+ }
+ 
+@@ -2091,6 +2096,12 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		break;
+ 	case MSR_IA32_TSC_ADJUST:
+ 		if (guest_cpuid_has_tsc_adjust(vcpu)) {
++
++if (printk_ratelimit()) {
++pr_warning("TSC adj %lld\n", data - vcpu->arch.ia32_tsc_adjust_msr);
++dump_stack();
++}
++
+ 			if (!msr_info->host_initiated) {
+ 				s64 adj = data - vcpu->arch.ia32_tsc_adjust_msr;
+ 				adjust_tsc_offset_guest(vcpu, adj);
